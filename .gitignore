@@ -1,0 +1,8 @@
+node_modules/
+
+# секреты — в GitHub Secrets, не в репозитории
+.env
+.env.*
+
+*.log
+.DS_Store

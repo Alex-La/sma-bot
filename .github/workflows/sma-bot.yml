@@ -1,0 +1,26 @@
+name: sma-bot
+on:
+  schedule:
+    - cron: "10 0 * * *" # каждый день в 00:10 UTC (GitHub может задержать запуск на 5–30 мин)
+  workflow_dispatch: # ручной запуск кнопкой "Run workflow"
+concurrency: sma-bot # не допускать двух запусков одновременно
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node src/bot.ts # зависимостей нет, TS исполняется нативно (type stripping)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          BINANCE_BASE: "https://testnet.binance.vision"
+          BOT_CAPITAL_USDT: "1000" # стартовый капитал
+          BOT_MONTHLY_USDT: "500" # пополнение 1-го числа каждого месяца (0 — без пополнений)
+          BOT_START: "2026-09-26" # дата старта; пополнения считаются с 1-го числа следующего месяца
+          SMA_PERIOD: "50"
+          DRY_RUN: "0"
