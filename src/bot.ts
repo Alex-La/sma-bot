@@ -29,8 +29,10 @@ import {
     evaluate,
     fmtPct,
     fmtPrice,
+    htmlToMarkdown,
     renderSignals,
     sendTelegram,
+    writeSummary,
     type Signal,
 } from "./signal.ts";
 
@@ -194,10 +196,14 @@ async function main(): Promise<void> {
     try {
         const text = await run();
         console.log(text);
+        // Сводку пишем ДО Telegram: отчёт не должен пропадать, если Telegram недоступен.
+        await writeSummary(htmlToMarkdown(text)).catch((e) => console.error(`summary: ${e}`));
         await sendTelegram(text);
     } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.error(`ERROR: ${msg}`);
+        // В сводке — блок кода: внутри него ничего не интерпретируется, даже HTML-страница от апстрима.
+        await writeSummary(`## ❗️ SMA-бот: ошибка\n\n\`\`\`\n${msg}\n\`\`\``).catch((e2) => console.error(`summary: ${e2}`));
         // Без escape любая HTML-страница от апстрима (451/502) ломает parse_mode=HTML и алерт не доходит.
         await sendTelegram(`❗️ SMA-бот: ошибка\n<code>${escapeHtml(msg.slice(0, 500))}</code>`).catch(() => { });
         process.exitCode = 1;

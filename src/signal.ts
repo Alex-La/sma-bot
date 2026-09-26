@@ -1,3 +1,5 @@
+import { appendFile } from "node:fs/promises";
+
 /**
  * Сигнал тренда SMA по рыночным данным Binance (mainnet) + отправка в Telegram.
  * Правило: монету держим, пока дневное закрытие (UTC) выше SMA(N), иначе USDT.
@@ -124,6 +126,19 @@ export function renderSignals(signals: Map<string, Signal>): string {
         lines.push(`   close ${fmtPrice(s.close)} · SMA ${fmtPrice(s.sma)} · ${fmtPct(s.dist)}`);
     }
     return lines.join("\n");
+}
+
+/** Отчёт из HTML (Telegram) в Markdown: <b> -> **, перевод строки -> жёсткий перенос. */
+export const htmlToMarkdown = (s: string) => s.replace(/<\/?b>/g, "**").split("\n").join("  \n");
+
+/**
+ * Дописать текст в сводку прогона GitHub Actions (видна на странице run, без копания в логах).
+ * Вне Actions переменной нет — тогда это no-op.
+ */
+export async function writeSummary(markdown: string): Promise<void> {
+    const file = process.env.GITHUB_STEP_SUMMARY;
+    if (!file) return;
+    await appendFile(file, `${markdown}\n`);
 }
 
 export async function sendTelegram(text: string): Promise<void> {
