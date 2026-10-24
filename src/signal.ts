@@ -121,7 +121,7 @@ export function renderSignals(signals: Map<string, Signal>): string {
     for (const [symbol, s] of signals) {
         const status = s.inMarket
             ? s.changed ? "🟢 <b>ВОЙТИ</b> ⚠️ сигнал сменился" : "🟢 держать"
-            : s.changed ? "🔴 <b>ВЫЙТИ</b> ⚠️ сигнал сменился" : "⚪️ вне рынка (USDT)";
+            : s.changed ? "🔴 <b>ВЫЙТИ</b> ⚠️ сигнал сменился" : "⚪️ вне рынка (USD)";
         lines.push(`<b>${symbol.replace(/USDT$/, "")}</b> — ${status}`);
         lines.push(`   close ${fmtPrice(s.close)} · SMA ${fmtPrice(s.sma)} · ${fmtPct(s.dist)}`);
     }
