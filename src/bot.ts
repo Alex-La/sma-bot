@@ -1,9 +1,9 @@
 /**
- * SMA-бот: сигнал по рыночным данным Binance (mainnet), исполнение на Binance Spot.
- * По умолчанию торгует на TESTNET.
+ * SMA-бот: сигнал по рыночным данным Binance (mainnet), исполнение на Alpaca (крипто, пары к USD).
+ * По умолчанию торгует на PAPER-счёте Alpaca.
  *
  * Капитал бота по графику пополнений:
- *   капитал = BOT_CAPITAL_USDT + BOT_MONTHLY_USDT × (число 1-х чисел месяца после BOT_START)
+ *   капитал = BOT_CAPITAL_USD + BOT_MONTHLY_USD × (число 1-х чисел месяца после BOT_START)
  * Каждое пополнение делится поровну между парами («корзины»).
  *
  * Логика (без хранения состояния):
@@ -11,16 +11,17 @@
  *    (clientOrderId начинается с "smabot");
  *  - свободные деньги корзины = её доля капитала + продажи − покупки;
  *  - сигнал «держать»: всё свободное докупается (вход или довложение нового пополнения);
- *  - сигнал «вне рынка»: позиция продаётся целиком, пополнения копятся в USDT до следующего входа;
+ *  - сигнал «вне рынка»: позиция продаётся целиком, пополнения копятся в USD до следующего входа;
  *  - пропущенный или повторный запуск безопасен: бот просто приводит корзины к сигналу.
  *
- * ENV: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BINANCE_API_KEY, BINANCE_API_SECRET,
- *      BINANCE_BASE (testnet по умолчанию), BOT_CAPITAL_USDT (1000), BOT_MONTHLY_USDT (0),
- *      BOT_START (YYYY-MM-DD, обязателен при BOT_MONTHLY_USDT > 0), MIN_ORDER_USDT (10),
- *      SMA_PERIOD (50), SYMBOLS (BTCUSDT,ETHUSDT — только пары к USDT), DRY_RUN ("1"), ALLOW_MAINNET ("1").
+ * ENV: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALPACA_API_KEY, ALPACA_SECRET_KEY,
+ *      ALPACA_BASE (paper по умолчанию), BOT_CAPITAL_USD (1000), BOT_MONTHLY_USD (0),
+ *      BOT_START (YYYY-MM-DD, обязателен при BOT_MONTHLY_USD > 0), MIN_ORDER_USD (10),
+ *      SMA_PERIOD (50), SYMBOLS (BTCUSDT,ETHUSDT — пары Binance к USDT для сигнала; на Alpaca торгуются BTC/USD, ETH/USD),
+ *      DRY_RUN ("1"), ALLOW_LIVE ("1").
  */
 import { pathToFileURL } from "node:url";
-import { Binance, floorToStep, type SymbolFilters } from "./binance.ts";
+import { Alpaca, filledQuote, floorToStep, type Asset } from "./alpaca.ts";
 import {
     SYMBOLS,
     dailyCloses,
@@ -51,18 +52,18 @@ interface Config {
 
 function readConfig(env = process.env): Config {
     const nonNeg = (x: number) => x >= 0;
-    const monthly = envNum(env, "BOT_MONTHLY_USDT", 0, nonNeg, "нужно неотрицательное число");
+    const monthly = envNum(env, "BOT_MONTHLY_USD", 0, nonNeg, "нужно неотрицательное число");
     const start = env.BOT_START ? new Date(`${env.BOT_START}T00:00:00Z`) : null;
     if (start && Number.isNaN(start.getTime())) throw new Error(`BOT_START="${env.BOT_START}" — нужен формат YYYY-MM-DD`);
-    if (monthly > 0 && !start) throw new Error("При BOT_MONTHLY_USDT > 0 нужен BOT_START (YYYY-MM-DD).");
+    if (monthly > 0 && !start) throw new Error("При BOT_MONTHLY_USD > 0 нужен BOT_START (YYYY-MM-DD).");
     return {
-        base: env.BINANCE_BASE ?? "https://testnet.binance.vision",
-        key: env.BINANCE_API_KEY ?? "",
-        secret: env.BINANCE_API_SECRET ?? "",
-        initial: envNum(env, "BOT_CAPITAL_USDT", 1000, nonNeg, "нужно неотрицательное число"),
+        base: env.ALPACA_BASE ?? "https://paper-api.alpaca.markets",
+        key: env.ALPACA_API_KEY ?? "",
+        secret: env.ALPACA_SECRET_KEY ?? "",
+        initial: envNum(env, "BOT_CAPITAL_USD", 1000, nonNeg, "нужно неотрицательное число"),
         monthly,
         start,
-        minOrder: envNum(env, "MIN_ORDER_USDT", 10, (x) => x > 0, "нужно положительное число"),
+        minOrder: envNum(env, "MIN_ORDER_USD", 10, (x) => x > 0, "нужно положительное число"),
         dryRun: env.DRY_RUN === "1",
     };
 }
@@ -74,7 +75,7 @@ export function monthsElapsed(start: Date, now = new Date()): number {
 }
 
 interface Slot {
-    f: SymbolFilters;
+    a: Asset;
     qty: number;
     cash: number; // продажи − покупки
     px: number;
@@ -82,16 +83,19 @@ interface Slot {
     executed: boolean; // реально отправленный ордер — попадёт в отчёт даже при сбое дальше
 }
 
-const orderId = (symbol: string) => `${PREFIX}_${symbol}_${Math.floor(Date.now() / 1000)}`;
+const orderId = (a: Asset) => `${PREFIX}_${a.base}${a.quote}_${Math.floor(Date.now() / 1000)}`;
+
+/** Пара Binance для сигнала → пара Alpaca для исполнения: BTCUSDT → BTC/USD. */
+const alpacaSymbol = (s: string) => `${s.replace(/USDT$/, "")}/USD`;
 
 export async function run(): Promise<string> {
     const cfg = readConfig();
-    const isTestnet = cfg.base.includes("testnet");
-    if (!isTestnet && process.env.ALLOW_MAINNET !== "1") {
-        throw new Error(`BINANCE_BASE=${cfg.base} не testnet. Для реальной торговли нужен ALLOW_MAINNET=1.`);
+    const isPaper = cfg.base.includes("paper-api");
+    if (!isPaper && process.env.ALLOW_LIVE !== "1") {
+        throw new Error(`ALPACA_BASE=${cfg.base} не paper. Для реальной торговли нужен ALLOW_LIVE=1.`);
     }
-    const hasKeys = Boolean(cfg.key && cfg.secret);
-    if (!cfg.dryRun && !hasKeys) throw new Error("Нет BINANCE_API_KEY / BINANCE_API_SECRET.");
+    // Ключи нужны и в DRY_RUN: без них Alpaca не отдаёт ни ассеты, ни цены.
+    if (!cfg.key || !cfg.secret) throw new Error("Нет ALPACA_API_KEY / ALPACA_SECRET_KEY.");
 
     const months = cfg.start ? monthsElapsed(cfg.start) : 0;
     const capital = cfg.initial + cfg.monthly * months;
@@ -100,38 +104,39 @@ export async function run(): Promise<string> {
     const signals = new Map<string, Signal>();
     for (const s of SYMBOLS) signals.set(s, evaluate(await dailyCloses(s)));
 
-    const ex = new Binance(cfg.base, cfg.key, cfg.secret);
-    await ex.syncTime();
-    const free = hasKeys ? await ex.freeBalances() : new Map<string, number>();
+    const ex = new Alpaca(cfg.base, cfg.key, cfg.secret);
+    let freeCash = await ex.buyingPower();
+    const held = await ex.positions();
 
     const slots = new Map<string, Slot>();
     for (const s of SYMBOLS) {
-        const f = await ex.filters(s);
-        // Капитал, MIN_ORDER_USDT и округление суммы покупки до 0.01 — всё в USDT.
-        if (f.quote !== "USDT") throw new Error(`${s}: котировка в ${f.quote}, поддерживаются только пары к USDT.`);
-        const { qty, cash } = hasKeys ? await ex.book(s, PREFIX) : { qty: 0, cash: 0 };
-        slots.set(s, { f, qty, cash, px: await ex.price(s), note: "без изменений", executed: false });
+        if (!s.endsWith("USDT")) throw new Error(`${s}: поддерживаются только пары к USDT (сигнал) → USD (Alpaca).`);
+        const a = await ex.asset(alpacaSymbol(s));
+        // Капитал, MIN_ORDER_USD и округление суммы покупки до 0.01 — всё в USD.
+        if (a.quote !== "USD") throw new Error(`${a.symbol}: котировка в ${a.quote}, поддерживаются только пары к USD.`);
+        const { qty, cash } = await ex.book(a.symbol, PREFIX);
+        slots.set(s, { a, qty, cash, px: await ex.price(a.symbol), note: "без изменений", executed: false });
     }
-    // Порог входа. Для выхода берём только minNotional биржи: MIN_ORDER_USDT не должен запирать позицию.
-    const minTrade = (st: Slot) => Math.max(cfg.minOrder, st.f.minNotional);
+    // Порог входа. Для выхода берём только минимум биржи: MIN_ORDER_USD не должен запирать позицию.
+    const minTrade = (st: Slot) => Math.max(cfg.minOrder, st.a.minNotional);
 
     try {
         // 1) Продажи: сигнал «вне рынка» — закрываем позицию целиком.
         for (const [s, st] of slots) {
             if (signals.get(s)!.inMarket || st.qty <= 0) continue;
-            const q = floorToStep(Math.min(st.qty, free.get(st.f.base) ?? st.qty), st.f.step);
-            if (Number(q) * st.px < st.f.minNotional) {
-                st.note = `продать нечего (остаток ${q} ${st.f.base})`;
+            const q = floorToStep(Math.min(st.qty, ex.heldQty(held, st.a.symbol)), st.a.step);
+            if (Number(q) * st.px < st.a.minNotional) {
+                st.note = `продать нечего (остаток ${q} ${st.a.base})`;
             } else if (cfg.dryRun) {
-                st.note = `DRY_RUN: продал бы ${q} ${st.f.base}`;
+                st.note = `DRY_RUN: продал бы ${q} ${st.a.base}`;
             } else {
-                const o = await ex.market(s, "SELL", { quantity: q }, orderId(s));
-                const got = Number(o.cummulativeQuoteQty);
-                free.set(st.f.quote, (free.get(st.f.quote) ?? 0) + got);
-                st.qty -= Number(o.executedQty);
+                const o = await ex.market(st.a.symbol, "sell", { qty: q }, orderId(st.a));
+                const got = filledQuote(o);
+                freeCash += got;
+                st.qty -= Number(o.filled_qty);
                 st.cash += got;
                 st.executed = true;
-                st.note = `🔴 ПРОДАНО ${o.executedQty} ${st.f.base} → ${fmtPrice(got)} ${st.f.quote}`;
+                st.note = `🔴 ПРОДАНО ${o.filled_qty} ${st.a.base} → ${fmtPrice(got)} ${st.a.quote}`;
             }
         }
 
@@ -140,23 +145,22 @@ export async function run(): Promise<string> {
             if (!signals.get(s)!.inMarket) continue;
             const idle = per + st.cash;
             if (!Number.isFinite(idle) || idle < minTrade(st)) continue;
-            const wasHolding = st.qty * st.px >= st.f.minNotional;
-            const freeQuote = free.get(st.f.quote) ?? idle;
-            const amt = floorToStep(Math.min(idle, freeQuote), "0.01");
+            const wasHolding = st.qty * st.px >= st.a.minNotional;
+            const amt = floorToStep(Math.min(idle, freeCash), "0.01");
             const what = wasHolding ? "довложение" : "вход";
             if (!(Number(amt) >= minTrade(st))) {
-                st.note = `${what}: не хватает ${st.f.quote} на счёте (нужно ${fmtPrice(idle)}, доступно ${fmtPrice(freeQuote)})`;
+                st.note = `${what}: не хватает ${st.a.quote} на счёте (нужно ${fmtPrice(idle)}, доступно ${fmtPrice(freeCash)})`;
             } else if (cfg.dryRun) {
-                st.note = `DRY_RUN: ${what}, купил бы на ${fmtPrice(Number(amt))} ${st.f.quote}`;
+                st.note = `DRY_RUN: ${what}, купил бы на ${fmtPrice(Number(amt))} ${st.a.quote}`;
             } else {
-                const o = await ex.market(s, "BUY", { quoteOrderQty: amt }, orderId(s));
-                const q = Number(o.executedQty);
-                const spent = Number(o.cummulativeQuoteQty);
-                free.set(st.f.quote, (free.get(st.f.quote) ?? 0) - spent);
+                const o = await ex.market(st.a.symbol, "buy", { notional: amt }, orderId(st.a));
+                const q = Number(o.filled_qty);
+                const spent = filledQuote(o);
+                freeCash -= spent;
                 st.qty += q;
                 st.cash -= spent;
                 st.executed = true;
-                st.note = `🟢 ${wasHolding ? "ДОКУПЛЕНО" : "КУПЛЕНО"} ${o.executedQty} ${st.f.base} на ${fmtPrice(spent)} ${st.f.quote} (~${fmtPrice(q ? spent / q : 0)})`;
+                st.note = `🟢 ${wasHolding ? "ДОКУПЛЕНО" : "КУПЛЕНО"} ${o.filled_qty} ${st.a.base} на ${fmtPrice(spent)} ${st.a.quote} (~${fmtPrice(q ? spent / q : 0)})`;
             }
         }
     } catch (e) {
@@ -170,7 +174,7 @@ export async function run(): Promise<string> {
     const lines = [
         renderSignals(signals),
         "",
-        `<b>Исполнение</b> (${isTestnet ? "testnet" : "⚠️ MAINNET"}${cfg.dryRun ? ", DRY_RUN" : ""})`,
+        `<b>Исполнение</b> (${isPaper ? "Alpaca paper" : "⚠️ Alpaca LIVE"}${cfg.dryRun ? ", DRY_RUN" : ""})`,
     ];
     let total = 0;
     let idleTotal = 0;
@@ -180,14 +184,13 @@ export async function run(): Promise<string> {
         total += value;
         idleTotal += idle;
         lines.push(`<b>${s.replace(/USDT$/, "")}</b>: ${st.note}`);
-        lines.push(`   корзина ${fmtPrice(value)} USDT, из них в USDT ${fmtPrice(idle)}`);
+        lines.push(`   корзина ${fmtPrice(value)} USD, из них в USD ${fmtPrice(idle)}`);
     }
     lines.push("");
-    lines.push(`Вложено: ${fmtPrice(capital)} USDT` + (cfg.monthly > 0 ? ` (${fmtPrice(cfg.initial)} + ${months}×${fmtPrice(cfg.monthly)})` : ""));
-    lines.push(`Стоимость: ${fmtPrice(total)} USDT (${fmtPct(total / capital - 1)}), в USDT ${fmtPrice(idleTotal)}`);
-    const freeQuote = free.get("USDT");
-    if (hasKeys && freeQuote !== undefined && freeQuote + 1 < idleTotal) {
-        lines.push(`⚠️ На счёте ${fmtPrice(freeQuote)} USDT — меньше, чем ждут корзины. Пополнение не пришло?`);
+    lines.push(`Вложено: ${fmtPrice(capital)} USD` + (cfg.monthly > 0 ? ` (${fmtPrice(cfg.initial)} + ${months}×${fmtPrice(cfg.monthly)})` : ""));
+    lines.push(`Стоимость: ${fmtPrice(total)} USD (${fmtPct(total / capital - 1)}), в USD ${fmtPrice(idleTotal)}`);
+    if (freeCash + 1 < idleTotal) {
+        lines.push(`⚠️ На счёте ${fmtPrice(freeCash)} USD — меньше, чем ждут корзины. Пополнение не пришло?`);
     }
     return lines.join("\n");
 }
